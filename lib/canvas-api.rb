@@ -157,6 +157,7 @@ module Canvas
       query_parameters = params.is_a?(Hash) ? params['query_parameters'] || params[:query_parameters] : {}
       generate_uri(endpoint, query_parameters)
       request = Typhoeus::Request.new(@uri.to_s, method: :put)
+      request.options[:headers]['Content-Type'] = "application/x-www-form-urlencoded"
       request.options[:body] = clean_params(params)
       retrieve_response(request)
     end
