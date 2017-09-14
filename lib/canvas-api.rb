@@ -6,7 +6,12 @@ require 'typhoeus'
 
 module Canvas
   class API
-    def initialize(args={}) 
+    AUTH_GRANT_TYPES = [
+      GRANT_TYPE_CREATE_TOKEN = "authorization_code".freeze,
+      GRANT_TYPE_REFRESH_TOKEN = "refresh_token".freeze
+    ]
+
+    def initialize(args={})
       @host = args[:host] && args[:host].to_s
       @token = args[:token] && args[:token].to_s
       @client_id = args[:client_id] && args[:client_id].to_s
@@ -18,60 +23,108 @@ module Canvas
       raise "token or client_id required" if !@token && !@client_id
       raise "secret required for client_id configuration" if @client_id && !@secret
     end
-  
+
     attr_accessor :host
     attr_accessor :token
     attr_accessor :client_id
-  
+
     def masquerade_as(user_id)
       @as_user_id = user_id && user_id.to_s
     end
-  
+
     def stop_masquerading
       @as_user_id = nil
     end
-  
+
     def self.encode_id(prefix, id)
       return nil unless prefix && id
       "hex:#{prefix}:" + id.to_s.unpack("H*")[0]
     end
-    
+
     def encode_id(prefix, id)
       Canvas::API.encode_id(prefix, id)
     end
-  
+
     def oauth_url(callback_url, scopes="")
       raise "client_id required for oauth flow" unless @client_id
       raise "secret required for oauth flow" unless @secret
       raise "callback_url required" unless callback_url
       raise "invalid callback_url" unless (URI.parse(callback_url) rescue nil)
       scopes ||= ""
-      scopes = scopes.length > 0 ? "&scopes=#{CGI.escape(scopes)}" : ""
-      "#{@host}/login/oauth2/auth?client_id=#{@client_id}&response_type=code&redirect_uri=#{CGI.escape(callback_url)}#{scopes}"
+
+      query_hash = {
+        client_id: @client_id,
+        response_type: 'code',
+        redirect_uri: CGI.escape(callback_url)
+      }
+
+      query_hash[:scopes] = CGI.escape(scopes) if scopes.length > 0
+
+      uri = URI(@host)
+      uri.path = "/login/oauth2/auth"
+      uri.query = query_hash.map { |param_name, value| [param_name, value].join("=") }.join('&')
+
+      uri.to_s
     end
-  
+
     def login_url(callback_url)
       oauth_url(callback_url, "/auth/userinfo")
     end
-  
-    def retrieve_access_token(code, callback_url)
+
+    def refresh_access_token(refresh_token, redirect_uri)
+      raise 'client_id required for oauth flow' if @client_id.nil?
+      raise 'secret required for oauth flow' if @secret.nil?
+      raise 'refresh_token required' if refresh_token.nil?
+      raise 'redirect_uri required' if redirect_uri.nil?
+      raise 'invalid redirect_uri' if (URI.parse(redirect_uri) rescue nil).nil?
+
+      @token = 'ignore'
+
+      response = post(
+        '/login/oauth2/token',
+        grant_type:    GRANT_TYPE_REFRESH_TOKEN,
+        client_id:     @client_id,
+        redirect_uri:  redirect_uri,
+        client_secret: @secret,
+        refresh_token: refresh_token
+      )
+
+      if response['access_token']
+        @token = response['access_token']
+      end
+
+      response
+    end
+
+    def retrieve_access_token(code, redirect_uri)
       raise "client_id required for oauth flow" unless @client_id
       raise "secret required for oauth flow" unless @secret
       raise "code required" unless code
-      raise "callback_url required" unless callback_url
-      raise "invalid callback_url" unless (URI.parse(callback_url) rescue nil)
+      raise "redirect_uri required" unless redirect_uri
+      raise "invalid redirect_uri" unless (URI.parse(redirect_uri) rescue nil)
+
       @token = "ignore"
-      res = post("/login/oauth2/token", :client_id => @client_id, :redirect_uri => callback_url, :client_secret => @secret, :code => code)
+
+      res = post(
+        "/login/oauth2/token",
+        :client_id => @client_id,
+        :redirect_uri => redirect_uri,
+        :client_secret => @secret,
+        :code => code,
+        :grant_type => GRANT_TYPE_CREATE_TOKEN,
+      )
+
       if res['access_token']
         @token = res['access_token']
       end
+
       res
     end
-  
+
     def logout
       !!delete("/login/oauth2/token")['logged_out']
     end
-  
+
     def validate_call(endpoint)
       raise "token required for api calls" unless @token
       raise "missing host" unless @host
@@ -80,7 +133,7 @@ module Canvas
       raise "invalid endpoint" unless endpoint.match(/^\/api\/v\d+\//) unless @token == 'ignore'
       raise "invalid endpoint" unless (URI.parse(endpoint) rescue nil)
     end
-  
+
     def generate_uri(endpoint, params=nil)
       validate_call(endpoint)
       unless @token == "ignore"
@@ -102,43 +155,52 @@ module Canvas
       @http.use_ssl = @uri.scheme == 'https'
       @uri
     end
-  
+
     def retrieve_response(request)
       request.options[:headers]['User-Agent'] = "CanvasAPI Ruby"
       if @insecure
         request.options[:ssl_verifypeer] = false
       end
+
       begin
         response = request.run
         raise ApiError.new("request timed out") if response.timed_out?
       rescue Timeout::Error => e
         raise ApiError.new("request timed out")
       end
+
       raise ApiError.new("unexpected redirect to #{response.headers['Location']}") if response.code.to_s.match(/3\d\d/)
+
       json = JSON.parse(response.body) rescue {'error' => 'invalid JSON'}
+
       if !json.is_a?(Array)
-        raise ApiError.new(json['error']) if json['error']
-        raise ApiError.new(json['errors']) if json['errors']
+        error_message = "#{json['error']} #{json['errors']} #{json['error_description']}".strip
+        raise ApiError.new(error_message) if json['error'] || json['errors']
+
         if !response.code.to_s.match(/2\d\d/)
           json['message'] ||= "unexpected error"
           json['status'] ||= response.code.to_s
-          raise ApiError.new("#{json['status']} #{json['message']}") 
+          raise ApiError.new("#{json['status']} #{json['message']}")
         end
+
       else
         json = ResultSet.new(self, json)
+
         if response.headers['Link']
           json.link = response.headers['Link']
           json.next_endpoint = response.headers['Link'].split(/,/).detect{|rel| rel.match(/rel="next"/) }.split(/;/).first.strip[1..-2].sub(/https?:\/\/[^\/]+/, '') rescue nil
         end
+
       end
+
       json
     end
-    
+
     # Semi-hack so I can write better specs
     def get_request(endpoint)
       Typhoeus::Request.new(@uri.to_s, method: :get)
     end
-  
+
     def get(endpoint, params=nil)
       generate_uri(endpoint, params)
       request = get_request(endpoint)
@@ -152,7 +214,7 @@ module Canvas
       request.options[:body] = clean_params(params)
       retrieve_response(request)
     end
-  
+
     def put(endpoint, params={})
       query_parameters = params.is_a?(Hash) ? params['query_parameters'] || params[:query_parameters] : {}
       generate_uri(endpoint, query_parameters)
@@ -160,7 +222,7 @@ module Canvas
       request.options[:body] = clean_params(params)
       retrieve_response(request)
     end
-  
+
     def post(endpoint, params={})
       query_parameters = params.is_a?(Hash) ? params['query_parameters'] || params[:query_parameters] : {}
       generate_uri(endpoint, query_parameters)
@@ -198,7 +260,7 @@ module Canvas
       end
       res
     end
-  
+
     def upload_file_from_local(endpoint, file, opts={})
       raise "Missing File object" unless file.is_a?(File)
       params = {
@@ -212,7 +274,7 @@ module Canvas
       elsif opts[:parent_folder_path] || opts['parent_folder_path']
         params[:parent_folder_path] = opts[:parent_folder_path] || opts['parent_folder_path']
       end
-      
+
       res = post(endpoint, params)
       if !res['upload_url']
         raise ApiError.new("Unexpected error: #{res['message'] || 'no upload URL returned'}")
@@ -222,7 +284,7 @@ module Canvas
       res = get(status_path)
       res
     end
-    
+
     def multipart_upload(url, upload_params, params, file)
       req = Typhoeus::Request.new(url, method: :post)
       upload_params.each do |k, v|
@@ -235,7 +297,7 @@ module Canvas
       raise ApiError.new("Unexpected error: #{res.body}") if !res.headers['Location']
       res.headers['Location']
     end
-  
+
     def upload_file_from_url(endpoint, opts)
       asynch = opts.delete('asynch') || opts.delete(:asynch)
       ['url', 'name', 'size'].each do |k|
@@ -277,11 +339,11 @@ module Canvas
     end
     attr_accessor :next_endpoint
     attr_accessor :link
-    
+
     def more?
       !!next_endpoint
     end
-    
+
     def next_page!
       ResultSet.new(@api, []) unless next_endpoint
       more = @api.get(next_endpoint)
